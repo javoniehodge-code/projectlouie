@@ -1,302 +1,302 @@
 # Project Louie — Data model and operation boundaries
 
-Status: Technical design proposal for implementation review. No migrations or application code are implemented by this document.
+Status: Technical design for implementation review, updated October 9, 2026 after final review. No migrations or application code exist yet.
 
-## Purpose and authority
-
-Define how Louie stores content and enforces the agreed behavior before adapting Stack code.
-
-Sources: [product.md](../product.md), [product-rules.md](../product-rules.md), and the user-flow decisions confirmed on October 9, 2026. The repository product documents currently lag several of those decisions; the confirmed updates below take precedence until they are synchronized.
-
-Confirmed updates:
-- Publish requires a title and at least one body item. Nonblank drafts autosave.
-- New-stack visibility defaults to public; owner home defaults to private view. These defaults are unrelated.
-- Omit location and tags.
-- Editing starts at Body and proceeds to Finalize; Preview is optional for edits.
-- Creator page supports search and pinning, with no featured-stack feature. Revised profile layout is deferred.
-- Privacy changes take effect immediately. Changed visibility into public/unlisted generates a fresh viewer link; revoked links stay inactive.
-- Story exports retain a five-page cap and use taller content areas. The cap supersedes the earlier full-content export requirement.
-- Collect viewer email subscriptions on creator pages and support creator-owned CSV export. Newsletter sending and provider integrations are deferred.
-- Analytics metric definitions and storage implementation are a separate design task.
-
-The designs below implement those rules. Technical choices are recommendations, not claims about existing Louie behavior.
+Sources: [product.md](../product.md) and [product-rules.md](../product-rules.md). If this document conflicts with them, the product documents win and this one must be corrected.
 
 ## Core identities
 
-A **stack** is an owner-controlled working object. A **publication** is its current published content and the stable unit for analytics. A **draft** is unpublished work. A **share link** is a revocable viewer entry point.
-
-Use different identifiers for these responsibilities:
-- stack_id: internal working object, never sufficient to grant anonymous access.
-- publication_id: stable across ordinary content republishing and privacy changes.
-- draft_id + revision: saved editing instance and its concurrency version.
-- share token: random viewer URL identifier; revoked independently of publication_id.
-
-Ordinary republishing does not create another publication or reset analytics. Publishing a surviving draft after deletion creates a new stack and publication, with new analytics identity and a new link.
+- A **stack** is the creator's working object.
+- A **publication** is a stack's current published content. It is the unit for analytics and keeps its identity through republishing and privacy changes.
+- A **draft** is unpublished work: either a new stack that hasn't been published, or the edit draft of a published one.
+- A **link code** is the random part of a stack's viewer URL. It can be revoked independently of the publication.
 
 ## Relationships
 
 ```mermaid
 erDiagram
+    PROFILES ||--o{ HANDLE_REGISTRY : reserves
     PROFILES ||--o{ STACKS : owns
-    STACKS ||--o| STACK_DRAFTS : contains
+    STACKS ||--o| STACK_DRAFTS : has
     STACKS ||--o| PUBLICATIONS : publishes
-    PUBLICATIONS ||--o{ SHARE_LINKS : addresses
+    PUBLICATIONS ||--o{ LINK_CODES : addressed_by
+    PUBLICATIONS ||--o{ ANALYTICS_EVENTS : measured_by
     PROFILES ||--o{ EMAIL_SUBSCRIPTIONS : collects
+    PROFILES ||--o{ REPORTS : receives
 ```
 
-Each stack has at most one active publication and one shared draft. A deleted publication leaves a metadata record; its content is removed. A surviving draft stays associated with the original stack until republished as a new stack.
+A stack has at most one publication and at most one draft.
 
-## Proposed records
+## Records
 
 ### profiles
 
 | Field | Type / constraint | Purpose |
 | --- | --- | --- |
-| id | UUID, primary key referencing authenticated user | Creator identity |
-| handle | Normalized text, unique | Public creator URL |
-| display_name | Nonempty text | Public attribution |
-| bio | Optional text | Retained as provisional profile field |
-| avatar_path | Optional text | Profile image reference; upload policy deferred |
-| external_links | Validated JSON array | Social/website links with stable IDs and labels |
-| revision | Positive bigint | Prevent stale profile saves |
-| created_at, updated_at | UTC timestamps | Audit and ordering |
+| id | UUID, primary key referencing the auth user | Creator identity |
+| handle | Unique, `^[a-z0-9._]{2,30}$` | Current public handle |
+| handle_changed_at | Nullable timestamp | Enforces one change per 30 days |
+| display_name | Nonempty, at most 50 characters | Attribution |
+| bio | Optional, at most 160 characters | Provisional until the profile design lands |
+| avatar_path | Optional storage path | Profile picture; upload rules wait on the profile design |
+| links | Validated JSON | Social and website links (reuse Stack's `socials.ts` field set and validation) |
+| status | active / suspended | Admin takedown |
+| revision | Integer, starts at 1 | Detects stale profile saves |
+| created_at, updated_at | Timestamps | |
 
-Keep authentication email and credentials in the authentication system, not the public profile projection. Avatar workflow, exact profile fields, and handle-change redirect rules need their own specification.
+Auth email and credentials stay in Supabase Auth.
+
+### handle_registry
+
+One shared registry enforces uniqueness for current, retired and deleted-account handles. `handle` is the primary key; `profile_id` is nullable and uses `ON DELETE SET NULL`; `state` is current / retired / reserved; timestamps record reservation and retirement. One current handle per live profile. Signup and handle changes claim names transactionally in this registry, including reserved application route names.
+
+Live retired handles redirect to the profile’s current handle. Account deletion makes all its handles reserved and clears their profile references without deleting reservations. A deleted account’s handles show unavailable, never redirect to unrelated content.
+
+### deleted_stack_ids
+
+Keeps only the deleted stack UUID and deletion timestamp permanently. Every first-save operation rejects a reserved deleted ID. No content or creator address is retained. This prevents a delayed initial save from recreating a deleted stack after normal rows have been removed.
 
 ### stacks
 
 | Field | Type / constraint | Purpose |
 | --- | --- | --- |
-| id | UUID, primary key | Internal working identity |
-| owner_id | UUID FK to profiles, immutable through client operations | Ownership |
-| lifecycle | active / retired | Retire an old container after its surviving draft moves |
-| created_at | UTC timestamp | Owner list ordering |
-| updated_at | UTC timestamp | Owner list ordering |
-
-Do not store a duplicated published content copy on this row. Privacy belongs to the publication or new-stack draft, not an ambiguous global status field. Retired containers cannot accept new saves/publications.
+| id | UUID primary key, supplied by the client on first save | Working identity; a retried create converges on the same row |
+| owner_id | FK to profiles | Ownership |
+| created_at, updated_at | Timestamps | Owner list ordering |
 
 ### stack_drafts
 
 | Field | Type / constraint | Purpose |
 | --- | --- | --- |
-| id | UUID, primary key | Draft instance identity |
-| stack_id | UUID FK, unique | Enforces one shared draft per stack |
-| content | Validated JSONB document | Title, description, ordered body |
-| schema_version | Positive integer | Explicit content format |
-| revision | Positive bigint | Stale-edit detection |
-| proposed_visibility | public / unlisted / private | Choice for an unpublished new stack |
-| edit_of_publication_id | Optional FK | Publication this edit originated from, including a deleted publication |
-| base_content_revision | Optional bigint | Publication revision used when the draft was opened |
-| created_at, updated_at | UTC timestamps | Recovery and management |
+| id | UUID primary key | Draft identity |
+| stack_id | FK, unique | One draft per stack |
+| content | Validated JSON ([content format](#content-format)) | Title, description and body |
+| revision | Integer, starts at 1 | Stale-save detection |
+| proposed_visibility | Nullable public / unlisted / private | Defaults to public for new drafts; null for edit drafts |
+| base_content_revision | Nullable integer | For edit drafts: the publication revision the draft was opened from |
+| created_at, updated_at | Timestamps | |
 
-For edits of a live publication, visibility comes from the current publication. Do not persist a draft privacy copy that can later undo an immediate privacy change. For new/surviving drafts, chosen visibility is publication intent and does not grant viewer access.
-
-A draft that existed before republishing must not be recreated by a stale autosave after publishing consumed it. Saves require the exact draft_id and revision; missing IDs produce a conflict, not an implicit upsert.
+An edit draft of a live publication never stores visibility; privacy comes from the publication, so an old draft can't undo a privacy change.
 
 ### publications
 
 | Field | Type / constraint | Purpose |
 | --- | --- | --- |
-| id | UUID, primary key | Stable analytics/publication identity |
-| stack_id | UUID FK, unique | One publication identity for this stack |
-| visibility | public / unlisted / private | Effective access |
-| content | Validated JSONB, null after deletion | Current viewer content |
-| schema_version | Positive integer | Rendering contract |
-| content_revision | Positive bigint | Changes only when content is republished |
-| access_revision | Positive bigint | Changes on visibility/link changes |
-| first_published_at | UTC timestamp | Original publication date |
-| content_updated_at | UTC timestamp | Last content publication |
-| deleted_at | Nullable UTC timestamp | Irreversible publication deletion |
-| search_document | Derived search vector, null when deleted | Creator-specific search |
-| pin_position | Optional integer | Public profile ordering; exact pin policy deferred |
+| id | UUID primary key | Analytics identity |
+| stack_id | FK, unique | |
+| visibility | public / unlisted / private | Current access |
+| content | Validated JSON | What viewers see |
+| content_revision | Integer | Increments on each republish |
+| access_revision | Integer | Increments on each privacy change |
+| last_draft_id | UUID | Most recently consumed draft, for traceability; retry safety uses mutation receipts |
+| first_published_at | Timestamp | Original publication date |
+| content_updated_at | Timestamp | "Last updated" date |
+| search_document | tsvector, derived | Creator-page search |
+| pin_position | Nullable integer | Only for public publications |
+| disabled_at | Nullable timestamp | Admin takedown |
 
-Deletion clears content and search data, removes pinning, and revokes links. Retain ID, ownership relationship, timestamps, and deletion state for analytics association. This is metadata retention, not a restorable copy of deleted content.
-
-Do not cascade publication deletion into draft or analytics deletion. Routine republication replaces content; historical content-version storage is not required for launch.
-
-### share_links
+### link_codes
 
 | Field | Type / constraint | Purpose |
 | --- | --- | --- |
-| id | UUID, primary key | Link record identity |
-| publication_id | UUID FK | Target publication |
-| token | Unique random URL-safe string | Viewer URL such as /s/TOKEN |
-| created_at | UTC timestamp | Issued time |
-| revoked_at | Nullable UTC timestamp | Permanent revocation |
-| issued_access_revision | Bigint | Trace visibility generation |
+| code | Primary key, 10 characters from `a–z` and `2–9`, excluding `i`, `l` and `o` | The random part of the URL |
+| publication_id | Nullable FK | The publication it opens; cleared when the stack is deleted |
+| created_at | Timestamp | |
+| revoked_at | Nullable timestamp | Permanent revocation |
 
-Generate tokens using a cryptographically secure generator with at least 128 bits of randomness; propose 32 random bytes. No sequential IDs or handles grant unlisted access. The token must be available to the owner for copying the current URL; store it in the access-controlled link table, and exclude it from general listings/logging.
+- Codes are generated with a cryptographically secure random generator. Ten characters from the 31-symbol alphabet give about 8 × 10^14 combinations. Combined with rate limiting on stack lookups, that makes guessing infeasible.
+- At most one unrevoked code per publication (partial unique index).
+- A live public or unlisted publication has exactly one active code. A private publication has none.
+- Revoked codes are never deleted or reissued, even after the stack is deleted, so an old URL can never open different content.
 
-Enforce at most one nonrevoked link per publication using a partial unique index. Private/deleted publications have zero active viewer links. Do not repurpose or reactivate revoked token rows.
+### Readable URLs
 
-Viewer APIs accept tokens, not internal publication IDs. Owner routes use internal IDs plus authenticated ownership.
+The canonical stack URL is `/{current handle}/{slug(current title)}-{active code}`. The slug is derived when the page is served, never stored. Lookup uses only the code. After access is validated, a URL with an outdated handle or slug redirects to the canonical form using a temporary, no-store redirect so browsers recheck access and later title changes. A URL with a revoked or unknown code shows "This stack isn't available."
 
 ### email_subscriptions
 
 | Field | Type / constraint | Purpose |
 | --- | --- | --- |
-| id | UUID, primary key | Subscription identity |
-| creator_id | UUID FK to profiles | Creator-specific list |
-| email | Validated normalized text | Delivery/export address |
-| status | pending / active / unsubscribed | Explicit lifecycle |
-| subscribed_at | UTC timestamp | Most recent signup time |
-| confirmed_at | Nullable UTC timestamp | Confirmation evidence if required |
-| unsubscribed_at | Nullable UTC timestamp | Subscription state evidence |
-| signup_source | Controlled value such as creator_page | CSV attribution |
-| created_at, updated_at | UTC timestamps | Record lifecycle |
+| id | UUID primary key | |
+| creator_id | FK to profiles | Which creator's list |
+| email | Normalized (trimmed, lowercased domain) | Address |
+| status | pending / active | Double opt-in state |
+| subscribed_at | Timestamp | Most recent form submission |
+| confirmed_at | Nullable timestamp | When the subscriber confirmed |
+| last_confirmation_sent_at | Nullable timestamp | Limits resends |
 
-Unique constraint on creator_id + normalized email. The same address can subscribe to multiple creators. Do not strip dots or plus-addressing as normalization.
+Unique on (creator_id, email). Dots and plus signs in the address are kept as entered.
 
-Email confirmation remains a product decision. The schema supports it; it does not silently adopt double opt-in. An anonymous repeated signup must not turn an unsubscribed address into active without the agreed resubscription flow.
+### subscription_tokens
 
-CSV includes email, signup date, source, and status. Default mailing-list export should include active subscribers; any broader export must clearly label status. Escape CSV cells to prevent spreadsheet formula execution. Public responses must not expose list contents or reveal another person's subscription history.
+Stores hashed tokens with a purpose (confirm / remove) and expiry; confirmation tokens expire after 7 days. Raw tokens appear only in email delivery. Removal links require a confirmation action, delete the subscription and all its tokens, and are inaccessible afterward. Token GET requests never mutate state. Owner address deletion uses the same transaction.
 
-If confirmation is adopted, store expiring hashed verification tokens in a separate private token table. Unsubscribe likewise uses purpose-bound tokens. Newsletter integrations are not needed for the initial collection/export flow.
+Repeated signup never downgrades active subscriptions. Resend delivery occurs outside the database transaction: reserve a rate-limited send attempt, mark successful delivery only after acceptance by Resend, and handle failed delivery/retries without duplicating or falsely activating a subscription.
 
-### mutation_receipts
+### analytics_events
 
-Record owner_id, operation, request_id, payload_hash, and safe result identifiers with a unique key on owner_id + operation + request_id.
+| Field | Type / constraint | Purpose |
+| --- | --- | --- |
+| id | Bigint identity | |
+| creator_id | FK | |
+| publication_id | Nullable FK | Null for creator-page views |
+| kind | view / link_click | |
+| visitor_id | Nullable UUID | From the first-party cookie; null when there's no consent |
+| url | Nullable text | For link_click: the URL clicked |
+| occurred_at | Timestamp | |
 
-Publishing, deleting, and changing privacy use request IDs to make retries safe. Reusing a request ID with a different payload is rejected. Never store subscriber CSV content or raw secrets in receipts. Set receipt retention before implementation; receipts are not a content archive.
+Events are accepted only for currently accessible active creator pages/publications, never owner visits. Link-click URLs must belong to the current authorized published snapshot and use the same normalization as rendering. Validate consent state; rate-limit visitors without identifiers by other safe request limits.
 
-## Content representation
+Raw events are kept for 90 days, then deleted by scheduled cleanup. V1 exposes only 7/30-day ranges, with distinct visitor IDs across each complete range. No daily unique-count summation or indefinite rollup. Click history for removed URLs remains within the range; stack/account deletion deletes associated events. Consent and measurement coverage follow the user-flow specification.
 
-Keep one compact, schema-validated JSON document per draft/publication. With a 6,000-character text budget and no need to query every paragraph independently, separate tables for every line are unnecessary initially.
+### reports
 
-Suggested shape:
-- title and description.
-- Ordered sections with stable section IDs and optional headings.
-- Ordered items with stable IDs and type: numbered, bullet, paragraph, or bold.
-- Text represented as plain text plus validated formatting/link segments.
-- Links with stable IDs, destination URL, and optional label.
+| Field | Type / constraint | Purpose |
+| --- | --- | --- |
+| id | UUID primary key | |
+| creator_id | FK | Reported creator |
+| publication_id | Nullable FK | Reported stack, if any |
+| reason | malicious_link / spam / adult / other | |
+| details | Optional, at most 500 characters | |
+| reporter_email | Optional | For follow-up |
+| status | open / actioned / dismissed | Admin review state |
+| created_at | Timestamp | |
 
-Do not accept arbitrary HTML. Validate shape, lengths, formats, URLs, item IDs, and attachment/order integrity in both application and database operations. Initial stack links support HTTP/HTTPS; profile contact-link types will be specified separately.
+### admin_actions
 
-Stable item/link IDs survive reordering and normal edits. A duplicated/new item gets a new ID. A freshly published surviving draft gets a new publication_id even if internal content IDs are preserved; analytics identity must therefore include publication_id.
+Records every takedown and reversal: admin user ID, action (disable_stack, enable_stack, suspend_creator, restore_creator, dismiss_report), target, optional report ID, and time. Admins are listed in a server-side allowlist.
 
-Known constraints: nonblank drafts; publish requires title plus body item; 6,000 total text characters; no location/tags. Exact field limits and URL/format-mark counting remain in the content specification. “Same as Stack” is not sufficient to copy inconsistent counters.
+## Content format
 
-Derive search only from current published text. Creator search filters by owner and public visibility; never index or return drafts/private/unlisted content through that endpoint.
+Louie uses Stack's content format as version 1, so the Create Stack flow carries over unchanged. Reference: Stack `web/src/lib/types.ts` (`Section`, `Line`) and the normalization in `web/supabase/migrations/20261011000000_link_only_lines.sql`.
 
-## Database operations and concurrency
+```json
+{
+  "schema_version": 1,
+  "title": "Three days in Tokyo",
+  "description": "Where I ate, walked and stayed.",
+  "sections": [
+    {
+      "label": "Day 1 — Shibuya",
+      "lines": [
+        {
+          "format": "num",
+          "text": "Coffee at **Blue Bottle**, then walk to miyashita-park.jp",
+          "link": "https://bluebottlecoffee.jp",
+          "linkName": "Menu",
+          "linkNames": { "miyashita-park.jp": "Park" }
+        }
+      ]
+    }
+  ]
+}
+```
 
-Implement each operation as a single database transaction. Do not assemble publication, link, and draft changes through separate browser writes.
+- `format` is `num`, `bullet` or `text`. Stack's legacy `bold` format, the per-line `bold` flag and the separate `note` field are not part of Louie.
+- Bold words are wrapped in `**` inside `text`.
+- Web addresses typed into `text` show as link pills; `linkNames` optionally names them.
+- `link` is one optional attached link with an optional `linkName`.
+- Links must be http(s), without whitespace, at most 2,048 characters, with a dotted host. The client and the database apply the same rule.
+- No HTML is accepted.
 
-Use a consistent lock order: stack, publication, draft. Serialize changes for the same stack while allowing unrelated stacks to proceed independently. Row locks serialize transactions; revision checks determine whether a user's content is stale.
+Link clicks are attributed by URL within a publication. If a URL appears twice in one stack, its clicks are combined; if the creator changes a URL, the new one starts at zero. Line and link IDs can be added in a later schema version if per-link history is needed.
 
-### Start a stack
+### Limits and counting
 
-Keep an empty editor local. On first nonblank save, create stack + draft together, defaulting proposed visibility to public. Use a client-generated request identity to avoid duplicate creation after a retry.
+| Field | Limit |
+| --- | --- |
+| Title | 60 characters; required to publish |
+| Description | 180 characters; optional |
+| Section heading | 60 characters |
+| Sections | 20 |
+| Lines | 100 |
+| Line text | 360 characters, not counting `**` marks |
+| Link name | 40 characters |
+| Attached link URL | 2,048 characters |
+| Total | 6,000 characters |
 
-### Open an edit draft
+The total counts the title, description, section headings and line text (excluding `**` marks). Addresses typed into line text count because they are text. Attached link URLs and link names don't count. The limits come from Stack `web/src/lib/format.ts`. Client and database validators must implement the same versioned rules. Count Unicode code points consistently (not JavaScript UTF-16 code units), with shared examples covering emoji, bold markers, URLs and link-only lines. Matching constants alone is insufficient. URL normalization and link-name lookup must agree across editor, renderer and analytics.
 
-Lock the stack, verify owner and active publication, and return its existing draft. If absent, copy published content into one new draft with base_content_revision. Concurrent opens must converge on the same draft.
+Validation functions, versioned with the schema: `validate_content_v1`, `has_draft_content_v1` (title, description or a nonempty line), `can_publish_content_v1` (title plus a line with text or a link) and `content_text_count_v1`.
 
-### Save draft
+## Operations
 
-Require draft_id, expected_revision, and validated content. Update only if the revision matches, then increment it and return the saved version. Zero matched rows means conflict/unavailable, never automatic creation.
+Each operation runs as one database transaction. Locks are taken in the same order every time: stack, then publication, then draft. Row locks serialize the work; revision checks decide whether a request is stale.
 
-Serialize autosaves per tab; ignore late responses older than the UI's latest acknowledged version. Preserve unsaved local work when a save fails or conflicts.
+| Operation | Behavior |
+| --- | --- |
+| Create draft | First nonblank save. Inserts stack and draft using the client’s stack ID. Checks deleted ID reservations. Retries use the original mutation receipt, never recreate a consumed/deleted draft. |
+| Open edit draft | Returns the existing edit draft, or copies the publication's content into a new one with `base_content_revision`. Concurrent opens get the same draft. |
+| Save draft | Requires the draft ID and expected revision. Saves and increments the revision. A missing draft or wrong revision returns a conflict, never a new draft. |
+| Publish new stack | Checks publish rules and link safety. Creates the publication, issues a code if public or unlisted, records `last_draft_id`, deletes the draft. A retry after a lost response uses its mutation receipt and cannot change a later publication. |
+| Republish | Requires the expected draft and content revisions. Replaces the content, increments `content_revision`, keeps the code and analytics, deletes the draft. Retries use mutation receipts; consumed drafts are never silently recreated. |
+| Change privacy | Requires expected access revision. Applies immediately. Public ↔ unlisted keeps the code. To private: revokes the code and clears the pin. Private → public or unlisted: issues a new code. Choosing the current visibility changes nothing. |
+| Delete stack | Rechecks the confirmed content/access/draft revisions; changed work requires fresh confirmation. Reserves the deleted stack ID, revokes its codes, then deletes publication, draft, analytics and stack atomically. Identical retries return their receipt. |
+| Delete draft | Deletes the exact draft revision. The publication is untouched. A later save to that draft gets a conflict. |
+| Change handle | Rejects if the last change was under 30 days ago or the handle is taken or retired. Retires the old handle and claims the new one in `handle_registry` atomically. |
+| Submit subscription | Rate-limited and protected by Turnstile. Creates or refreshes a pending row, preserves existing active status and reserves a rate-limited email attempt; never reveals existing status. |
+| Confirm subscription | Explicit POST with valid unexpired token → status active; GET is read-only. |
+| Remove subscription | Owner deletion or subscriber removal-token confirmation deletes address and tokens; future exports exclude it. |
+| Delete account | Removes profile, owned content, events, addresses/tokens and media; revokes links, reserves handles/stack IDs and invalidates sessions. |
+| Set pins | Validates that every ID is the owner's live public publication and replaces the order atomically. |
 
-### Publish a new stack
+## Access
 
-Lock stack/draft and check ownership, expected draft revision, validation, and request ID. Create publication, issue a viewer link only for public/unlisted, and consume the draft atomically.
-
-A lost response retried with the same request ID returns the original successful result. An old-tab save after publication cannot recreate the consumed draft.
-
-### Republish an existing stack
-
-Require expected draft revision, expected content revision, and expected access revision. Replace publication content/search and increment content_revision; consume the draft in the same transaction. Preserve publication_id, first_published_at, and current valid link.
-
-If privacy changed while the editor was open, refresh Finalize and require acknowledgement; do not revert it during content publication. Explicit privacy selection is a separate immediate operation, followed by rereading access_revision before publication.
-
-### Change privacy
-
-Verify owner, expected access revision, and request ID under the same stack lock. If unchanged, do nothing. Otherwise revoke the current link, update visibility/access_revision, and issue a fresh link if the destination is public/unlisted.
-
-Do not write draft content. Search and profile responses apply effective visibility immediately. Any stale publish attempt sees an access conflict and must refresh.
-
-### Delete a publication
-
-Use expected content/access revisions and a request ID to avoid deleting a version the creator did not confirm. Revoke links, clear published content/search/pin data, and set deleted_at atomically. Keep the existing draft and analytics association.
-
-Late publication attempts return publication-deleted and require the new-publication flow. Do not automatically restore a publication or create an edit draft after deletion.
-
-### Delete a draft
-
-Delete only the selected draft_id after ownership/revision checks. A stale delete must not remove a replacement/newer draft. A late autosave for that ID is rejected. The publication is untouched.
-
-### Publish a surviving draft
-
-Require explicit visibility selection and latest draft revision. Confirm the source publication is deleted. Create a new stack and publication, issue a new viewer link if shareable, consume the old draft, and retire the old stack container in one transaction.
-
-Keep the deleted publication metadata for historical analytics. Fresh publication_id is the boundary for fresh analytics. Old links never redirect to the new publication.
-
-## Access boundary
-
-| Data/action | Anonymous viewer | Owner | Other authenticated user |
+| Data / action | Anonymous viewer | Owner | Other signed-in user |
 | --- | --- | --- | --- |
-| Creator public profile | Public projection | Same projection + own tools | Public projection |
-| Public creator stack list/search | Public publications only | Same public projection | Public publications only |
-| Public/unlisted stack by valid token | Current published content | Current published content | Current published content |
-| Private publication | Denied | Allowed via owner route | Denied |
-| Drafts and owner management | Denied | Own records only | Denied |
-| Revoked/deleted token | Unavailable | Unavailable viewer URL; use owner tools | Unavailable |
-| Subscriber list/export | Denied | Own list only | Denied |
-| Submit subscription | Validated endpoint | Same endpoint | Same endpoint |
+| Creator public page | Public fields | Same, plus owner tools | Public fields |
+| Creator's public stack list and search | Live public publications | Same | Live public publications |
+| Stack by valid code | Published content | Published content | Published content |
+| Private stack | Unavailable | Through owner routes | Unavailable |
+| Drafts and Manage | Denied | Own only | Denied |
+| Analytics, subscribers, CSV | Denied | Own only | Denied |
+| Submit subscription or report | Allowed | Allowed | Allowed |
 
-Keep raw draft/publication/link/subscription tables owner-protected with Row Level Security and explicit grants. Do not grant anonymous SELECT access to all unlisted rows merely because their visibility is unlisted.
+Suspended creators and disabled stacks are unavailable publicly, including search, previews, images, event submission and subscriptions. Owners retain authenticated inspect/download/delete access. Publishing, republishing and public sharing of affected content are denied until restored; owner access never mints a public link.
 
-Provide narrow read operations for public lists and token resolution. Token resolution returns only the current allowed content; no raw link table enumeration. Prefer invoker functions for owner operations. A tightly scoped privileged reader, where necessary, must have explicit validation, a fixed search path, restricted execute grants, and a safe response projection.
-
-The service role must never reach the browser. Subscription inserts also go through a constrained endpoint, not unrestricted anonymous table writes.
-
-Initial viewer responses should avoid shared caching of stack content and token-resolution outcomes until revocation behavior is verified. A privacy change cannot recall content/images a viewer already received, but subsequent requests must recheck access. Owner data must never enter shared public caches.
-
-## Supporting features
-
-**Exports:** Generate story images from content the requester is entitled to read. Five-page cap, taller stack content region, readable typography, source ordering, and creator attribution. Overflow uses the current viewer link for public/unlisted stacks. Private/draft overflow copy remains a design decision; never invent a public link for them.
-
-**Pinning:** pin_position affects only live public publications. Clear the pin on deletion or transition away from public, so old pins do not reappear unexpectedly. Pin count and UI remain deferred.
-
-**Analytics:** Retain publication identity through normal republishing/privacy changes; never accept client events for revoked/private/deleted viewer access. Exact visitor definitions, event schema, aggregation, retention, and infrastructure remain a separate technical design. Account deletion and its effects on analytics/subscribers also require a dedicated scope decision.
+Raw tables are not readable or writable from the browser. Public reads go through narrow functions that return only what the viewer may see. The service-role key stays on the server.
 
 ## Worked example
 
-1. Creator saves Tokyo itinerary: stack S1, draft D1 revision 1; no viewer link.
-2. Creator publishes public: publication P1 content revision 1, link A; D1 is consumed.
-3. Creator edits: D2 is created from P1. Viewers still see P1's old content.
-4. Public → unlisted: A is revoked, B issued; P1 keeps its analytics identity.
-5. Creator republishes: P1 content revision increases, B remains valid.
-6. Creator opens D3, then deletes P1: B is revoked; P1 content cleared; D3 survives.
-7. Creator publishes D3 as public: new stack S2, publication P2, link C; P2 analytics starts fresh.
-8. A and B remain inactive. P1's historical analytics remains separate from P2.
+1. Maya saves "Tokyo itinerary": stack S1 and draft D1 are created. There is no link yet.
+2. She publishes it as public: publication P1 and code `k7q2m9xd4p` are created. The URL is `/maya/tokyo-itinerary-k7q2m9xd4p`.
+3. She renames it "Three days in Tokyo" and republishes. The URL becomes `/maya/three-days-in-tokyo-k7q2m9xd4p`; the old one redirects.
+4. She makes it unlisted. The code stays, and it leaves her page.
+5. She makes it private. `k7q2m9xd4p` is revoked forever.
+6. She makes it public again. A new code, `w3n8c5hj2r`, is issued; P1 keeps its analytics.
+7. She changes her handle to `mayatravels`. `/maya` and every old stack URL with a live code redirect to the new handle.
+8. She deletes the stack. `w3n8c5hj2r` stops working; P1, its draft and its analytics are deleted.
 
-## Verification required before implementation is accepted
+## Verification required before acceptance
 
 | Scenario | Required result |
 | --- | --- |
-| Two tabs open Edit simultaneously | One shared draft |
-| Two tabs save the same revision | One succeeds; the other receives conflict |
-| Autosave arrives after publication/deletion | No draft recreation |
-| Publish response is lost and retried | Same result; no duplicate publication/link |
-| Privacy changes while an edit is open | Content unchanged; stale publish cannot revert privacy |
-| Privacy rotation races with token resolution | Requests use committed access state; revoked URLs stop resolving |
-| Publication deletion races with republishing | One serialized outcome; no automatic restoration |
-| Published deletion with surviving draft | Draft retained, content cleared, link revoked |
-| Surviving draft published | New publication/link; old analytics remains separate |
-| Anonymous raw API enumeration | No unlisted/private/draft content or link tokens |
-| Creator search after privacy/deletion | Only current public publications |
-| Subscription repeated/cross-creator export | No duplicates; no access to another creator's list |
+| Two tabs open Edit at once | One shared draft |
+| Two tabs save the same revision | One succeeds; the other gets a conflict |
+| Autosave arrives after publish or delete | No draft is recreated |
+| Publish response lost and retried | Same result; no duplicate publication or code |
+| Public → unlisted → public | Same code throughout |
+| Any → private → public | Old code dead; new code works |
+| Privacy change while an edit is open | Draft unchanged; republish can't undo the privacy change |
+| Rename, then open an old URL | Redirects to the new canonical URL |
+| Handle change, then open `/old-handle` and an old stack URL | Both redirect |
+| Second handle change within 30 days | Rejected |
+| Another creator claims a retired handle | Rejected |
+| Delete stack, then open its URL | Unavailable; code never reissued |
+| Anonymous raw API access | No unlisted, private, draft, subscriber or analytics data |
+| Repeated subscription to the same creator | One row; response doesn't reveal status |
+| Owner views own stack | No analytics event |
+| Unsafe link in a stack | Publish blocked with an explanation |
 
-Test these against the real database grants/functions, not only mocked UI behavior.
+Run these against the real database roles, grants and functions, not only mocks.
 
-## Next deliverable
-
-Write the operation/API contracts and SQL migration proposal from this model, including exact request/response/error formats, constraints, RLS policies, and transactional functions. Reconcile the product documents with the latest flow decisions before building UI against those contracts.
-
-Official implementation references:
+References:
 - [Supabase Row Level Security](https://supabase.com/docs/guides/database/postgres/row-level-security)
 - [Supabase database functions](https://supabase.com/docs/guides/database/functions)
 - [PostgreSQL row locking](https://www.postgresql.org/docs/17/explicit-locking.html)
-- [PostgreSQL indexes](https://www.postgresql.org/docs/current/sql-createindex.html)
+
+## Mutation receipts and final-review checks
+
+Each mutation carries a UUID action ID, scoped to authenticated actor and operation, with a payload fingerprint. Commit the successful result receipt atomically with its changes. Identical retries return the recorded result; different payload reuse is rejected. Revision checks still reject stale new actions. Keep receipts for the supported retry window (at least 90 days); expired action IDs require state reconciliation and are never silently replayed. Deleted stack IDs stay reserved permanently.
+
+Verification additionally covers: a delayed first save after deletion; old publish/privacy retries after a newer action; concurrent handle signup/change; account deletion retaining reservations; scanner GETs leaving subscriptions unchanged; removal excluding future exports; active signup preserving active state; and every public surface rejecting disabled/suspended content while owner inspect/download/delete remains available.
