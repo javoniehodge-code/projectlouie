@@ -47,11 +47,23 @@ Creators can skip the title and description steps. A saved draft must contain at
 
 ### Editing published stacks
 
-Editing a published stack creates a separate draft copy associated with that published stack. Edits stay in the draft until the creator publishes the changes. Viewers continue seeing the existing published version throughout editing. Publishing the draft replaces the existing published version; it does not create an additional published stack.
+Editing a published stack creates a separate draft copy associated with that published stack. Each published stack has one shared edit draft. Edits stay in that draft until the creator publishes the changes or deletes the draft. Stale tabs receive a conflict prompt rather than silently overwriting newer saved work. Viewers continue seeing the existing published version throughout editing. Publishing the draft replaces the existing published version; it does not create an additional published stack.
 
-### Private stack exports
+### Privacy changes and links
 
-Creators can export private stacks as images and share those images externally. The stack itself remains private, and its link remains accessible only to the owner.
+Changing a public stack to unlisted invalidates the old public link and generates a new unlisted link. Changing a public stack to private blocks viewer access; the owner retains access.
+
+### Deletion
+
+Deleting a published stack leaves its associated edit draft and historical analytics intact. Its old link stays inactive. Publishing the surviving draft requires choosing privacy and creates a new published stack with a new link and fresh analytics. Deleting an edit draft leaves the existing published stack unchanged.
+
+### Content limits
+
+Each stack has a total limit of 6,000 characters. Detailed character counting rules and field limits will be specified separately.
+
+### Stack exports
+
+Creators can generate shared images or exports from any type of stack, including drafts and private stacks. The stack itself remains private, and its link remains accessible only to the owner.
 
 ## Initial release screen inventory
 
@@ -96,11 +108,15 @@ Editing an existing stack begins at the body screen, where its title and descrip
 
 ### Analytics
 
-Only the creator can access analytics, through Settings. Analytics covers individual stack activity and link clicks. Exact metrics will be defined in a separate specification.
+Only the creator can access analytics, through Settings. Analytics includes total visitors, unique visitors, and link clicks. Historical analytics remain after deletion of a published stack. A new publication created from a surviving draft starts with fresh analytics. Exact metric definitions will be specified separately.
 
 ### Sharing
 
 Creators can share stacks as links or social media friendly images. Generated images can also be saved as pictures. Relevant sharing behavior and designs from the original Stack project will be reviewed for reuse.
+
+### Viewer email subscriptions
+
+Viewers can subscribe to a creator's email list. This is separate from creator account signup and is included in the initial release scope. Form placement, list management, and email delivery or export integrations will be defined in a separate flow specification.
 
 ## Outside the initial scope
 
@@ -119,7 +135,9 @@ Existing Stack designs can be reused or adapted where they support Louie's scope
 
 - Whether search within a creator's public stacks is included at launch. Navigation from an individual stack to the creator's page is confirmed; a search feature is not yet confirmed.
 - The exact controls on the finalize screen and placement of the prompt to view other stacks.
-- Detailed sharing options, analytics metrics, and deletion outcomes.
-- Detailed publishing behavior, including privacy changes and what happens if a published stack is deleted while an associated edit draft exists.
+- Detailed sharing options, analytics definitions, content counting rules, and the email subscription flow.
+- Privacy transitions beyond public to unlisted/private, stale-tab conflict resolution, and access to retained analytics for deleted publications.
+
+See [product-rules.md](product-rules.md) for confirmed product rules.
 
 Detailed access rules, editing behavior, deletion outcomes, sharing options, and analytics definitions belong in the supporting product rules and flow specifications.
